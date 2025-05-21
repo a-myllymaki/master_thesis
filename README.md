@@ -14,17 +14,22 @@ The project involves:
 
 ## Repository Structure
 scripts/
+
 ├── 02_exploratory_analysis.R # Histograms, PCA, GMM etc.
+
 ├── 03_regression_task.R # ASRS score prediction, SHAP, counterfactual analysis
+
 ├── 04_classification_task.R # ASRS screening classification, XGBoost vs k-NN
+
 ├── 05_thesis_figures.R # Plotting R-generated examples for the methods section in thesis
+
 data/
+
 ├── cleaned_data.csv # Anonymized and preprocessed data
-figures/
-├── (optional) saved output figures if needed
 
 
-> NOTE: The `01_data_cleaning.R` script is excluded due to participant privacy concerns. The uploaded dataset (`cleaned_data.csv`) is fully anonymized and post-cleaning.
+
+NOTE: The `01_data_cleaning.R` script is excluded due to participant privacy concerns. The uploaded dataset (`cleaned_data.csv`) is fully anonymized and post-cleaning.
 
 This project was developed in R version `4.4.1`.
 
