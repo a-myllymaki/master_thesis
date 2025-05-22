@@ -1,0 +1,832 @@
+library(pacman)
+pacman::p_load(dplyr,tidyr,iml, xgboost, counterfactuals,data.table, reshape2,tidyverse, 
+               caret, cluster,factoextra, plotly, ggcorrplot, purrr,class, SHAPforxgboost,
+               ggrepel,jmotif, ggplot2,combinat, corrplot, viridis, ggpubr, ggthemes,
+               gridExtra, patchwork,colorblindr,psych,tibble,dichromat,tidyverse)
+
+####################### REGRESSION TASK #######################
+#=================================== 
+# DATA PREPARATION
+#=================================== 
+# The dataframe merged_data contains cognitive task performance data
+# The dataframe ASRS_scores contains ASRS data 
+
+merged_data <- read_csv("cleaned_data.csv", col_types = cols(...1 = col_skip()))
+reg_data <- merged_data %>%
+  inner_join(ASRS_scores %>% select(id, total_ASRS_score), by = "id") %>%
+  left_join(chronotype, by = "id") %>%
+  ungroup()%>%
+  select(-c(id)) %>%
+  select(-total_ASRS_score,  everything(), total_ASRS_score ) # place ASRS score at the end of dataframe
+
+# Split train and test data
+set.seed(2025)
+train_index <- sample(1:nrow(reg_data), 0.7 * nrow(reg_data))
+train_data <- reg_data[train_index, ]
+test_data  <- reg_data[-train_index, ]
+
+# Convert data to DMatrix so it's compatbile with xgboost function
+dtrain <- xgb.DMatrix(data = as.matrix(train_data %>% select(-total_ASRS_score)),
+                          label = train_data$total_ASRS_score)
+dtest <- xgb.DMatrix(data = as.matrix(test_data %>% select(-total_ASRS_score)),
+                         label = test_data$total_ASRS_score)
+dfull <- xgb.DMatrix(data = as.matrix(reg_data %>% select(-total_ASRS_score)),
+                         label = reg_data$total_ASRS_score)
+
+#=================================== 
+# 5 FOLD CV - LEARNING CURVES 
+#=================================== 
+# 5-fold cross validation for tree depth = 2,3,4 
+# and nrounds = 60, rest are default hyperparameters
+
+set.seed(2025)
+max_depths <- c(2, 3, 4) # tree depths
+
+# Run 5-fold CV for each max_depth
+cv_results <- map_dfr(max_depths, ~{
+  params <- list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    max_depth = .x,
+    lambda = 1,
+    gamma = 0,
+    eta = 0.3
+  )
+  
+  xgb.cv(
+    params = params,
+    data = dfull,
+    nrounds = 60,  # large enough to see plateau
+    nfold = 5,
+    verbose = FALSE
+  )$evaluation_log %>% 
+    mutate(max_depth = as.factor(.x))
+})
+
+# Plot learning curves
+ggplot(cv_results, aes(x = iter, y = train_rmse_mean, color = max_depth)) +
+  geom_line(size = 1) +
+  geom_line(aes(x = iter, y=test_rmse_mean, color = max_depth))+
+  labs(
+    x = "Number of boosting rounds (nrounds)",
+    y = "RMSE (CV error)",
+    title = "Learning curves (5-fold CV)",
+    subtitle = "Thin lines = testing data, thick lines = training data",
+    color = "Max depth",
+    fill = "Max depth") +
+  theme_minimal()
+
+#=================================== 
+# TRAIN FINAL REGRESSION MODEL
+#=================================== 
+
+best_params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  max_depth = 2,
+  eta = 0.3,
+  lambda = 1,
+  gamma = 0
+)
+
+best_model <- xgb.train(
+  booster = "gbtree",
+  params = best_params ,
+  data = dtrain ,
+  nrounds = 10,
+  watchlist = list(train = dtrain, test = dtest)
+)
+
+#Evaluate on test set
+test_preds <- predict(best_model, dtest)
+test_rmse <- sqrt(mean((test_data$total_ASRS_score - test_preds)^2))
+cat("Test RMSE:", test_rmse)
+
+#=================================== 
+# RESIDUAL ANALYSIS
+#=================================== 
+
+# RESIDUALS IN PCA - TEST DATA 
+# Get test set predictions and residuals
+test_preds <- predict(best_model, dtest)
+residuals_test <- test_data$total_ASRS_score - test_preds
+analysis_residual_df <- cbind(test_data %>% select(-total_ASRS_score), 
+                         Residual = residuals_test)
+
+scaled_features <- scale(analysis_residual_df %>% select(-Residual))
+pca <- prcomp(scaled_features, center = TRUE, scale. = TRUE)
+pca_df <- data.frame(PC1 = pca$x[,1], 
+                         PC2 = pca$x[,2],
+                         Residual = analysis_residual_df$Residual)
+
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Residual)) +
+  geom_point(alpha = 0.7, size = 3) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", 
+                        midpoint = 0, 
+                        limits = c(-max(abs(residuals_test)), max(abs(residuals_test)))) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals in PCA space (test data)",
+       subtitle = "(red = overprediction, blue = underprediction)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") 
+
+# RESIDUALS IN PCA - TRAIN DATA 
+# Get train set predictions and residuals_train
+train_preds <- predict(best_model, dtrain)
+residuals_train <- train_data$total_ASRS_score - train_preds
+analysis_df_train <- cbind(train_data %>% select(-total_ASRS_score), 
+                               Residual = residuals_train)
+
+scaled_features_train <- scale(analysis_df_train %>% select(-Residual))
+pca_train <- prcomp(scaled_features_train, center = TRUE, scale. = TRUE)
+pca_df_train <- data.frame(PC1 = pca_train$x[,1], 
+                               PC2 = pca_train$x[,2],
+                               Residual = analysis_df_train$Residual)
+
+
+ggplot(pca_df_train, aes(x = PC1, y = PC2, color = Residual)) +
+  geom_point(alpha = 0.7, size = 3) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", 
+                        midpoint = 0, 
+                        limits = c(-max(abs(residuals_train)), max(abs(residuals_train)))) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals in PCA space (train data)",
+       subtitle = "(red = overprediction, blue = underprediction)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") 
+
+# PCA RESIDUALS - FULL DATA 
+# Get full data set predictions and residuals
+full_preds <- predict(best_model, dfull)
+residuals_full <- reg_data$total_ASRS_score - full_preds
+analysis_df_full <- cbind(reg_data %>% select(-total_ASRS_score), 
+                              Residual = residuals_full)
+
+scaled_features_full <- scale(analysis_df_full %>% select(-Residual))
+pca_full <- prcomp(scaled_features_full, center = TRUE, scale. = TRUE)
+pca_df_full <- data.frame(PC1 = pca_full$x[,1], 
+                              PC2 = pca_full$x[,2],
+                              Residual = analysis_df_full$Residual)
+
+
+ggplot(pca_df_full, aes(x = PC1, y = PC2, color = Residual)) +
+  geom_point(alpha = 0.7, size = 3) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", 
+                        midpoint = 0, 
+                        limits = c(-max(abs(residuals_full)), max(abs(residuals_full)))) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals in PCA space (full data)",
+       subtitle = "(red = overprediction, blue = underprediction)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") 
+
+
+#=================================== 
+# RESIDUAL BAR PLOT
+#=================================== 
+# Plot mean residual per range 
+
+residuals_df <- reg_data %>%
+  mutate(predicted_score = full_preds, residual = residuals_full) 
+
+# Group actual scores into bins
+residuals_df <- residuals_df %>%
+  mutate(score_bin = cut(total_ASRS_score,
+                         breaks = c(-Inf, seq(0,64, by=8)),
+                         labels = c("(0–8]", "(0–8]", "(8–16]", "(16–24]", "(24–32]", "(32–40]", "(40–48]",
+                                    "(48–56]","(56–64]")))
+
+# Compute average residual per bin
+bias_by_bin <- residuals_df %>%
+  group_by(score_bin) %>%
+  summarise(
+    mean_residual = mean(residual, na.rm = TRUE),
+    sd_residual = sd(residual, na.rm = TRUE),
+    n = n()
+  )
+
+print(bias_by_bin)
+bias_by_bin$asrs
+
+# Plot residuals
+ggplot(bias_by_bin, aes(x = score_bin, y = mean_residual)) +
+  geom_col(fill = "#69b3a2",color = "black", alpha = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  ylab("Mean residual per range") +
+  xlab("True ASRS score") +
+  ggtitle("Residuals by ASRS score ranges") +
+  theme_minimal()
+
+#=================================== 
+# RESIDUAL NEAREST NEIGHBORS
+#===================================
+# Dataframe with features, actual values, predictions, residuals and train/test indicator
+residual_analysis_df <- reg_data %>% 
+  bind_cols(
+    predicted = full_preds,
+    residual = residuals_full,
+    data_type = ifelse(1:nrow(reg_data) %in% train_index, "train", "test")
+  ) %>%
+  rename(actual = total_ASRS_score)
+
+#  Find nearest neighbors in feature space
+# extract only the feature columns for distance calculation
+features <- residual_analysis_df %>% select(-c(actual, predicted, residual, data_type))
+
+features_scaled <- scale(features) # standardize features for distance calculation
+
+dist_matrix <- as.matrix(dist(features_scaled), "manhattan")
+
+# Function to find the k nearest neighbors and their residual ratios
+find_nn_feature_space <- function(i, k = 3) {
+  # Set distance to self as Inf to exclude it
+  my_dist <- dist_matrix[i, ]
+  my_dist[i] <- Inf
+  
+  # Find k nearest neighbors
+  nn_indices <- order(my_dist)[1:k]
+  
+  # Get residuals
+  r_0 <- residuals[i]
+  nn_residuals <- residuals[nn_indices]
+  
+  # Calculate ratios (handle division by zero)
+  if (r_0 == 0) {
+    r_0 <- 1e-10 # if residual is zero, use a small value to avoid division by zero
+  }
+  
+  ratios <- nn_residuals / r_0
+  
+  return(data.frame(
+    index = i,
+    r_0 = r_0,
+    r_1 = nn_residuals[1],
+    r_2 = if(k >= 2) nn_residuals[2] else NA,
+    r_3 = if(k >= 3) nn_residuals[3] else NA,
+    r_1_r_0 = ratios[1],
+    r_2_r_0 = if(k >= 2) ratios[2] else NA,
+    r_3_r_0 = if(k >= 3) ratios[3] else NA
+  ))
+}
+
+# Find nearest neighbors in residual space
+find_nn_residual_space <- function(i, k = 3) {
+  res_diffs <- abs(residuals - residuals[i]) # calculate absolute differences in residuals
+  res_diffs[i] <- Inf  # Exclude self
+  
+  # Find k nearest neighbors
+  nn_indices <- order(res_diffs)[1:k]
+  
+  # Get residuals
+  r_0 <- residuals[i]
+  nn_residuals <- residuals[nn_indices]
+  
+  # Calculate ratios (handle division by zero)
+  if (r_0 == 0) {
+    r_0 <- 1e-10 # if residual is zero, set small value to avoid division by zero
+  }
+  
+  ratios <- nn_residuals / r_0
+  
+  return(data.frame(
+    index = i,
+    r_0 = r_0,
+    r_1 = nn_residuals[1],
+    r_2 = if(k >= 2) nn_residuals[2] else NA,
+    r_3 = if(k >= 3) nn_residuals[3] else NA,
+    r_1_r_0 = ratios[1],
+    r_2_r_0 = if(k >= 2) ratios[2] else NA,
+    r_3_r_0 = if(k >= 3) ratios[3] else NA
+  ))
+}
+
+
+# Feature space neighbors
+feature_space_results <- map_dfr(1:nrow(residual_analysis_df), find_nn_feature_space)
+feature_space_results$data_type <- residual_analysis_df$data_type
+feature_space_results$actual <- residual_analysis_df$actual
+
+# Residual space neighbors
+residual_space_results <- map_dfr(1:nrow(residual_analysis_df), find_nn_residual_space)
+residual_space_results$data_type <- residual_analysis_df$data_type
+residual_space_results$actual <- residual_analysis_df$actual
+
+# Plot feature space neighbors
+plot_feature_space <- plot_ly(
+  data = feature_space_results,
+  x = ~r_1_r_0,
+  y = ~r_2_r_0,
+  z = ~r_3_r_0,
+  color = ~data_type,
+  colors = c("train" = "blue", "test" = "red"),
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 3),
+  hoverinfo = "text",
+  text = ~paste("Index:", index, 
+                "<br>r_0:", round(r_0, 3),
+                "<br>Data type:", data_type)
+) %>% 
+  layout(
+    title = "Residual ratios (feature space neighbors)",
+    scene = list(
+      xaxis = list(title = "r_1/r_0"),
+      yaxis = list(title = "r_2/r_0"),
+      zaxis = list(title = "r_3/r_0")
+    )
+  )
+
+# Plot residual space neighbors
+plot_residual_space <- plot_ly(
+  data = residual_space_results,
+  x = ~r_1_r_0,
+  y = ~r_2_r_0,
+  z = ~r_3_r_0,
+  color = ~data_type,
+  colors = c("train" = "blue", "test" = "red"),
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 3),
+  hoverinfo = "text",
+  text = ~paste("Index:", index, 
+                "<br>Original residual:", round(r_0, 3),
+                "<br>Data type:", data_type)
+) %>% 
+  layout(
+    title = "Residual ratios (residual space neighbors)",
+    scene = list(
+      xaxis = list(title = "r_1/r_0"),
+      yaxis = list(title = "r_2/r_0"),
+      zaxis = list(title = "r_3/r_0")
+    )
+  )
+
+# Filter out extreme ratios for better visualization
+filter_extreme <- function(df, threshold) {
+  df %>%
+    filter(abs(r_1_r_0) < threshold, 
+           abs(r_2_r_0) < threshold, 
+           abs(r_3_r_0) < threshold)
+}
+
+# Filtered plots
+filtered_feature_space <- filter_extreme(feature_space_results, threshold = 10)
+filtered_residual_space <- filter_extreme(residual_space_results, threshold = 1.5)
+
+plot_feature_space_filtered <- plot_ly(
+  data = filtered_feature_space,
+  x = ~r_1_r_0,
+  y = ~r_2_r_0,
+  z = ~r_3_r_0,
+  color = ~data_type,
+  colors = c("train" = "blue", "test" = "red"),
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 4),
+  hoverinfo = "text",
+  text = ~paste("Index:", index, 
+                "<br>r_0:", round(r_0, 3),
+                "<br>Data type:", data_type)
+) %>% 
+  layout(
+    title = "Residual ratios in feature space",
+    scene = list(
+      xaxis = list(title = "r_1/r_0"),
+      yaxis = list(title = "r_2/r_0"),
+      zaxis = list(title = "r_3/r_0")
+    )
+  )
+
+plot_residual_space_filtered <- plot_ly(
+  data = filtered_residual_space,
+  x = ~r_1_r_0,
+  y = ~r_2_r_0,
+  z = ~r_3_r_0,
+  color = ~data_type,
+  colors = c("train" = "blue", "test" = "red"),
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 4),
+  hoverinfo = "text",
+  text = ~paste("Index:", index, 
+                "<br>r_0:", round(r_0, 3),
+                "<br>Data type:", data_type)
+) %>% 
+  layout(
+    title = "Residual ratios in residual space",
+    scene = list(
+      xaxis = list(title = "r_1/r_0"),
+      yaxis = list(title = "r_2/r_0"),
+      zaxis = list(title = "r_3/r_0")
+    )
+  )
+
+# PRINT PLOTS
+
+plot_feature_space
+plot_residual_space
+plot_feature_space_filtered
+plot_residual_space_filtered
+
+# check pattern of ratios
+summary_feature_space <- feature_space_results %>%
+  group_by(data_type) %>%
+  summarize(
+    mean_r1_r0 = mean(r_1_r_0, na.rm = TRUE),
+    mean_r2_r0 = mean(r_2_r_0, na.rm = TRUE),
+    mean_r3_r0 = mean(r_3_r_0, na.rm = TRUE),
+    median_r1_r0 = median(r_1_r_0, na.rm = TRUE),
+    median_r2_r0 = median(r_2_r_0, na.rm = TRUE),
+    median_r3_r0 = median(r_3_r_0, na.rm = TRUE)
+  )
+
+summary_residual_space <- residual_space_results %>%
+  group_by(data_type) %>%
+  summarize(
+    mean_r1_r0 = mean(r_1_r_0, na.rm = TRUE),
+    mean_r2_r0 = mean(r_2_r_0, na.rm = TRUE),
+    mean_r3_r0 = mean(r_3_r_0, na.rm = TRUE),
+    median_r1_r0 = median(r_1_r_0, na.rm = TRUE),
+    median_r2_r0 = median(r_2_r_0, na.rm = TRUE),
+    median_r3_r0 = median(r_3_r_0, na.rm = TRUE)
+  )
+
+# SUMMARIES
+print("Summary of Feature Space Neighbor Ratios:")
+print(summary_feature_space)
+
+print("Summary of Residual Space Neighbor Ratios:")
+print(summary_residual_space)
+
+#=================================== 
+# SHAP ANALYSIS
+#===================================
+# Choose data range where prediciton is OK
+reg_data_reduced <- residual_analysis_df %>% select(-c(residual,data_type)) %>% filter(actual %in% (15:33))
+shap <- shap.prep(best_model, X_train = data.matrix(reg_data_reduced %>% select(-c(actual, predicted))))  
+
+# Beeswarm plot
+shap.plot.summary(shap)
+
+## PLOT SHAP-LINE PLOT (NOT USED IN THESIS)
+# Convert to wide format (one row per participant)
+shap_wide <- shap %>% # participant × feature SHAP dataframe
+  select(ID, variable, value) %>%
+  pivot_wider(names_from = variable, values_from = value)
+
+# Merge with original ASRS Scores
+shap_wide <- shap_wide %>%
+  left_join(reg_data %>% mutate(ID = row_number()) %>% select(ID, total_ASRS_score),
+            by = "ID")
+
+shap_long <- shap_wide %>%
+  pivot_longer(cols = -c(ID, total_ASRS_score), 
+               names_to = "feature", 
+               values_to = "shap_value") 
+
+
+ggplot(shap_long, aes(x = feature, y = shap_value, group = ID)) +
+  geom_line(data = subset(shap_long, !ID %in% extreme_ids), 
+            color = "gray50", alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Individual SHAP Profiles",
+       x = "Cognitive feature",
+       y = "SHAP Value")
+
+
+# Color by actual ASRS Score 
+ggplot(shap_long, aes(x = feature, y = shap_value, group = ID, 
+                          color = total_ASRS_score)) +
+  geom_line(alpha = 0.5, linewidth = 0.7) +
+  scale_color_viridis(
+    name = "ASRS Score",
+    option = "plasma", 
+    breaks = c(min(shap_long$total_ASRS_score), 
+               median(shap_long$total_ASRS_score), 
+               max(shap_long$total_ASRS_score)),
+    labels = c("Low", "Medium", "High")
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "SHAP profiles colored by actual ASRS score",
+    subtitle = "Lines represent individual participants",
+    x = "Cognitive Feature",
+    y = "SHAP Value"
+  )
+
+
+## ORIGINAL SHAP VALUES IN MDS
+# Compute Manhattan distance matrix with SHAP values
+dist_MH <- dist(shap_wide %>% select(-c(ID, total_ASRS_score)), method = "manhattan")
+
+# Run MDS
+mds_MH <- cmdscale(dist_MH, k = 3) 
+mds_MH_df <- data.frame(
+  MDS1 = mds_MH[,1],
+  MDS2 = mds_MH[,2],
+  MDS3 = mds_MH[,3],
+  ASRS_score = reg_data_reduced$actual,
+  Predicted = reg_data_reduced$predicted
+)
+
+# Plot MDS SHAP values and color by predicted score
+ggplot(mds_MH_df, aes(x = MDS1, y = MDS3, color = Predicted)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = median(mds_MH_df$Predicted)) +
+  labs(title = "SHAP profiles in MDS space",
+       color = "Predicted\nASRS Score") 
+
+
+## RELATIVE SHAP VALUES IN MDS
+shap_matrix <- as.matrix(shap_wide %>% select(-ID, -total_ASRS_score))
+rownames(shap_matrix) <- shap_wide$ID
+
+# Compute relative shap
+# Calculate total deviation (sum of SHAP values) for each ID
+shap_total <- shap %>%
+  group_by(ID) %>%
+  summarize(total_deviation = sum(value)) %>%
+  ungroup()
+
+# Join total deviation back to original data and calculate relative SHAP
+shap_relative <- shap %>%
+  left_join(shap_total, by = "ID") %>%
+  mutate(relative_shap = value / total_deviation) %>%
+  # Handle division by zero (if total_deviation = 0)
+  mutate(relative_shap = ifelse(is.nan(relative_shap), 0, relative_shap))
+
+# Convert to wide format 
+shap_wide_relative <- shap_relative %>%
+  dplyr::select(c(ID, variable, relative_shap))%>%
+  tidyr::pivot_wider(names_from = variable, values_from = relative_shap)
+
+shap_matrix_relative <- as.matrix(shap_wide_relative %>% dplyr::select(-ID))
+rownames(shap_matrix_relative) <- shap_wide_relative$ID
+
+# Compute Manhattan distance matrix
+dist_MH_relative <- dist(shap_wide_relative[, -1], method = "manhattan")
+
+# Run MDS with relative shap
+mds_MH_relative <- cmdscale(dist_MH_relative, k = 3) 
+mds_MH_relative_df <- data.frame(
+  ID = rownames(shap_matrix_relative),
+  MDS1 = mds_MH_relative[,1],
+  MDS2 = mds_MH_relative[,2],
+  MDS3 = mds_MH_relative[,3],
+  ASRS_score = reg_data_reduced$actual,
+  Predicted = reg_data_reduced$predicted
+)
+
+# Plot MDS relative SHAP values and color by predicted score
+ggplot(mds_MH_relative_df, aes(x = MDS1, y = MDS2, color = Predicted)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = median(mds_MH_relative_df$Predicted)) +
+  labs(title = "Relative SHAP Profiles in MDS Space",
+       color = "Predicted ASRS Score") 
+
+ggplot(mds_MH_relative_df, aes(x = MDS2, y = MDS3, color = Predicted)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = median(mds_MH_relative_df$Predicted)) +
+  labs(title = "Relative SHAP Profiles in MDS Space, zoomed in",
+       color = "ASRS Score") + coord_cartesian(ylim = c(-5, 5), xlim = c(-5,5))
+
+ggplot(mds_MH_relative_df, aes(x = MDS1, y = MDS3, color = Predicted)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = median(mds_MH_relative_df$Predicted)) +
+  labs(title = "Relative SHAP profiles in MDS space (zoomed in)",
+       color = "Predicted\nASRS Score") + coord_cartesian(ylim = c(-2.5, 1.5), xlim = c(0,5))
+
+
+#=================================== 
+# COUNTERFACTUAL ANALYSIS
+#===================================
+# Choose data range where prediciton is OK, plus a little higher
+train_data_reduced <- train_data %>% dplyr::filter(total_ASRS_score %in% (15:33))
+test_data_reduced <- test_data %>% dplyr::filter(total_ASRS_score %in% (15:33))
+feature_cols <- setdiff(colnames(train_data_reduced), "total_ASRS_score")
+
+# The below code follows the examples given in the following package github-pages:
+# https://github.com/giuseppec/iml
+# https://github.com/dandls/counterfactuals
+
+# Function needed to compute counterfactuals
+predict_fun <- function(model, newdata) {
+  newdata <- as.matrix(newdata[, feature_cols])  
+  new_dmatrix <- xgb.DMatrix(data = newdata)
+  predict(model, new_dmatrix)
+}
+
+cf_predictor <- Predictor$new(
+  model = best_model,
+  data = train_data[, feature_cols],
+  y = train_data$total_ASRS_score,
+  predict.function = predict_fun,
+  type = "regression"
+)
+
+##### Notation comment: x_interest = x* (where x* is defined in the thesis)
+# Choose x* that is predicted above moderate-threshold (i.e., above 30)
+preds_CF <- predict(best_model, xgb.DMatrix(data = as.matrix(test_data_reduced  %>% select(-total_ASRS_score)),
+                                             label = test_data_reduced$total_ASRS_score))
+asrs_preds_CF <- which(preds_CF > 30) # find instances predicted as moderate ASRS
+
+# FIND COUNTERFACTUALS FOR ONE SPECIFIC INSTANCE
+selected_idx <- asrs_preds_CF[2] # choose one of the instances, I just arbitrarily chose nr 2
+x_interest <- test_data_reduced[selected_idx, feature_cols] # save only the features of chosen the instance x*
+actual_asrs_CF <- test_data_reduced[selected_idx, "total_ASRS_score"] %>% as.numeric() # save the actual ASRS score of x*
+
+# First get the actual prediction for x*
+predicted_score <- cf_predictor$predict(x_interest) %>% as.numeric()
+cat("Predicted ASRS score:", predicted_score, 
+    "\n Actual ASRS score: ", actual_asrs_CF)
+
+# Determine desired outcome range based on scoring table
+# Example: If we want counterfactuals showing how to reach "mild to moderate" range, choose (31-39)
+desired_outcome_low <- c(0,30)
+desired_outcome_mild_moderate <- c(31, 39) # not used
+desired_outcome_high <- c(40,49) # not used
+desired_outcome_very_high <- c(50,72) # not used
+
+desired_outcome <- desired_outcome_low
+
+# Define original bounds
+lower_bounds <- apply(train_data_reduced[, feature_cols], 2, min)
+upper_bounds <- apply(train_data_reduced[, feature_cols], 2, max)
+
+# age
+lower_bounds["age"] <- x_interest$age
+upper_bounds["age"] <- 70
+
+# Initialize WhatIfRegr method
+whatif_regr <- WhatIfRegr$new(
+  predictor = cf_predictor,
+  n_counterfactuals = 4L,  # number of counterfactuals to retrieve, here it's 4
+  lower = lower_bounds,  
+  upper = upper_bounds,  
+  distance_function = "gower"  # gower distance 
+)
+
+# Find counterfactuals
+cfactuals <- whatif_regr$find_counterfactuals(
+  x_interest = x_interest,
+  desired_outcome = desired_outcome
+)
+
+# Get evaluation metrics, how to interpret:
+# dist_x_interest: How different the counterfactual is from original (0 = identical, 1 = completely different)
+# no_changed: Number of altered features (6-7 features modified)
+# dist_train: Distance to nearest training instances (0 = counterfactuals come from training data)
+# dist_target: Distance to target range (0 = perfect match)
+# minimality: How many features could revert to original without affecting outcome
+evaluation <- cfactuals$evaluate()
+cat("\nCounterfactual evaluation:\n")
+print(evaluation)
+
+# Visualize parallel plot of counterfactuals
+cfactuals$plot_parallel() +
+  ggtitle("Parallel Plot of Counterfactual Features")
+
+
+##### FIND FOUR COUNERFACTUALS FOR EACH INSTANCE OVER THRESHOLD
+
+cf_summary <- data.table(
+  participant_idx = integer(),
+  predicted_score = numeric(),
+  actual_score = numeric(),
+  cf_score = numeric(),
+  cf_found = logical(),
+  dist_x_interest = numeric(),
+  no_changed = integer(),
+  minimality = numeric()
+)
+
+feature_change_log <- list()
+
+# Loop over participants predicted > 30
+asrs_preds_CF <- which(preds_CF > 30)
+n_to_find <- 4L
+for (i in 1:length(asrs_preds_CF)) {
+  selected_idx <- asrs_preds_CF[i] 
+  x_interest <- test_data_reduced[selected_idx, feature_cols]
+  actual_score <- test_data_reduced[selected_idx, "total_ASRS_score"] %>% as.numeric()
+  predicted_score <- cf_predictor$predict(x_interest) %>% as.numeric()
+  
+  lower_bounds <- apply(train_data_reduced[, feature_cols], 2, min)
+  upper_bounds <- apply(train_data_reduced[, feature_cols], 2, max)
+  
+  # Get SDs from training data
+  feature_sds <- apply(train_data_reduced[, feature_cols], 2, sd)
+
+  x_vec <- as.numeric(x_interest)
+  names(x_vec) <- colnames(x_interest)
+  
+  ################################## UNCOMMENT BELOW IF YOU WANT TO BOUND 
+  ################################## THE FEATURES WITH +/- SD
+  ## Now compute bounds, with +/- 1.5 SD
+  # lower_bounds <- x_vec - 1.5 * feature_sds
+  # upper_bounds <- x_vec + 1.5 * feature_sds
+  # 
+  # ## Clip to global range
+  # global_mins <- apply(train_data_reduced[, feature_cols], 2, min)
+  # global_maxs <- apply(train_data_reduced[, feature_cols], 2, max)
+  # 
+  # lower_bounds <- pmax(lower_bounds, global_mins)
+  # upper_bounds <- pmin(upper_bounds, global_maxs)
+
+  # age restriction
+  lower_bounds["age"] <- x_vec["age"]
+  upper_bounds["age"] <- max(reg_data$age)
+  
+  # CFA predictor
+  whatif_regr <- WhatIfRegr$new(
+    predictor = cf_predictor,
+    n_counterfactuals = n_to_find,
+    lower = lower_bounds,
+    upper = upper_bounds,
+    distance_function = "gower"
+  )
+  
+  # Try to generate counterfactual
+  tryCatch({
+    cfactuals <- whatif_regr$find_counterfactuals(
+      x_interest = x_interest,
+      desired_outcome = c(0, 30)
+    )
+    eval <- cfactuals$evaluate()
+    for (j in 1:n_to_find) {
+      cf_point <- cfactuals$data[j, ]
+      changed <- names(x_interest)[x_interest != cf_point]
+      feature_change_log[[length(feature_change_log) + 1]] <- changed
+    }
+    cf_score <- cf_predictor$predict(cf_point) %>% as.numeric()
+    
+    cf_summary <- rbind(cf_summary, data.table(
+      participant_idx = i,
+      predicted_score = predicted_score,
+      actual_score = actual_score,
+      cf_score = cf_score,
+      cf_found = TRUE,
+      dist_x_interest = eval$dist_x_interest[1],
+      no_changed = eval$no_changed[1],
+      minimality = eval$minimality[1]
+    ))
+    
+  }, error = function(e) {
+    cf_summary <- rbind(cf_summary, data.table(
+      participant_idx = i,
+      predicted_score = predicted_score,
+      actual_score = actual_score,
+      cf_score = NA,
+      cf_found = FALSE,
+      dist_x_interest = NA,
+      no_changed = NA,
+      minimality = NA
+    ))
+  })
+}
+
+# Summarize Results
+cat("Number of successful counterfactuals:\n")
+print(table(cf_summary$cf_found))
+
+if (any(cf_summary$cf_found)) {
+  cat("\nMean features changed:\n")
+  print(mean(cf_summary$no_changed[cf_summary$cf_found], na.rm = TRUE))
+  
+  cat("\nMean distance from original:\n")
+  print(mean(cf_summary$dist_x_interest[cf_summary$cf_found], na.rm = TRUE))
+  
+  cat("\nMean minimality:\n")
+  print(mean(cf_summary$minimality[cf_summary$cf_found], na.rm = TRUE))
+}
+
+# Feature change frequency Plot 
+if (length(feature_change_log) > 0) {
+  changed_features <- unlist(feature_change_log)
+  change_freq <- as.data.frame(table(changed_features))
+  colnames(change_freq) <- c("Feature", "Count")
+  
+  plot_change_freq_cfa <- ggplot(change_freq, aes(x = reorder(Feature, Count), y = Count)) +
+    geom_bar(stat = "identity", fill = "#69b3a2", color = "black", alpha = 1) +
+    coord_flip() +
+    labs(
+      title = "Most frequently changed features (constraints on age only)",
+      x = "Feature",
+      y = "Count"
+    ) +
+    theme_minimal()
+  print(plot_change_freq_cfa)
+}
