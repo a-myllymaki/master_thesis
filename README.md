@@ -1,5 +1,5 @@
 # master_thesis
-# ADHD Prediction Thesis – Analysis Scripts
+# Predicting ADHD Symptom Severity from Cognitive Tasks and Chronotype: An Interpretable Machine Learning Approach – R scripts
 
 This repository contains the R code used for the data analysis in my master's thesis on predicting adult ADHD symptom severity using cognitive task performance, chronotype and age.
 
@@ -25,11 +25,12 @@ scripts/
 
 data/
 
-├── cleaned_data.csv # Anonymized and preprocessed data
+└── [not included] # cleaned_data.csv (available upon request)
 
-
-
-NOTE: The `01_data_cleaning.R` script is excluded due to participant privacy concerns. The uploaded dataset (`cleaned_data.csv`) is fully anonymized and post-cleaning.
+## Notes
+- The `01_data_cleaning.R` script is excluded due to participant privacy concerns.
+- The dataset used (`cleaned_data.csv`) is fully anonymized and includes only post-cleaning features.  
+  **It is not included in this repository, but can be shared upon request for academic purposes.**
 
 This project was developed in R version `4.4.1`.
 
