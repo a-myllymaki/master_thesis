@@ -30,7 +30,7 @@ data/
 ## Notes
 - The `01_data_cleaning.R` script is excluded due to participant privacy concerns.
 - The dataset used (`cleaned_data.csv`) is fully anonymized and includes only post-cleaning features.  
-  **It is not included in this repository, but can be shared upon request for academic purposes.**
+  **It is not included in this repository, but can be shared upon request for review purposes.**
 
 This project was developed in R version `4.4.1`.
 
