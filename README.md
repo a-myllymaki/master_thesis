@@ -1,5 +1,5 @@
 # master_thesis
-# Predicting ADHD Symptom Severity from Cognitive Tasks and Chronotype: An Interpretable Machine Learning Approach – R scripts
+# An Interpretable and Comprehensive Machine Learning Study of ADHD Symptom Severity from Cognitive Tasks and Chronotype – R scripts
 
 This repository contains the R code used for the data analysis in my master's thesis on predicting adult ADHD symptom severity using cognitive task performance, chronotype and age.
 
